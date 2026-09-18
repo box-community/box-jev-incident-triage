@@ -12,17 +12,42 @@ from pathlib import Path
 
 import msgspec
 from box_sdk_gen import (
+    BoxAPIError,
     BoxClient,
     BoxDeveloperTokenAuth,
+    CreateFileMetadataByIdScope,
+    CreateMetadataTemplateFields,
+    CreateMetadataTemplateFieldsOptionsField,
+    CreateMetadataTemplateFieldsTypeField,
     FetchOptions,
+    GetFileMetadataByIdScope,
     ResponseFormat,
+    UpdateFileByIdParent,
     UploadFileAttributes,
     UploadFileAttributesParentField,
+    UpdateFileMetadataByIdRequestBody,
+    UpdateFileMetadataByIdRequestBodyOpField,
+    UpdateFileMetadataByIdScope,
 )
 from typesafe_sdk import Choice, Noul, Score, TypeSafeClient
 
 
 BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_METADATA_TEMPLATE_KEY = "jevIncidentTriage"
+METADATA_TEMPLATE_DISPLAY_NAME = "Jev Incident Triage"
+METADATA_FIELD_KEYS = {
+    "incident_type",
+    "triage_decision",
+    "severity_score",
+    "severity_confidence",
+    "escalation_probability",
+    "incident_type_confidence",
+}
+DESTINATION_FOLDER_ENV = {
+    "ESCALATE": "BOX_ESCALATE_FOLDER_ID",
+    "MONITOR": "BOX_MONITOR_FOLDER_ID",
+    "REVIEW": "BOX_REVIEW_FOLDER_ID",
+}
 
 QUESTIONS = {
     "incident_type": Choice(
@@ -72,6 +97,178 @@ def required(name: str) -> str:
 
 def box_client() -> BoxClient:
     return BoxClient(BoxDeveloperTokenAuth(required("BOX_DEVELOPER_TOKEN")))
+
+
+def metadata_template_key() -> str:
+    value = os.environ.get("BOX_METADATA_TEMPLATE_KEY", DEFAULT_METADATA_TEMPLATE_KEY).strip()
+    return value or DEFAULT_METADATA_TEMPLATE_KEY
+
+
+def metadata_template_fields() -> list[CreateMetadataTemplateFields]:
+    enum_type = CreateMetadataTemplateFieldsTypeField.ENUM
+    return [
+        CreateMetadataTemplateFields(
+            type=enum_type,
+            key="incident_type",
+            display_name="Incident type",
+            options=[
+                CreateMetadataTemplateFieldsOptionsField(key=value)
+                for value in ("availability", "security_or_privacy", "data_integrity", "other")
+            ],
+        ),
+        CreateMetadataTemplateFields(
+            type=enum_type,
+            key="triage_decision",
+            display_name="Triage decision",
+            options=[
+                CreateMetadataTemplateFieldsOptionsField(key=value)
+                for value in ("ESCALATE", "REVIEW", "MONITOR")
+            ],
+        ),
+        CreateMetadataTemplateFields(
+            type=CreateMetadataTemplateFieldsTypeField.FLOAT,
+            key="severity_score",
+            display_name="Severity score",
+        ),
+        CreateMetadataTemplateFields(
+            type=CreateMetadataTemplateFieldsTypeField.FLOAT,
+            key="severity_confidence",
+            display_name="Severity confidence",
+        ),
+        CreateMetadataTemplateFields(
+            type=CreateMetadataTemplateFieldsTypeField.FLOAT,
+            key="escalation_probability",
+            display_name="Escalation probability",
+        ),
+        CreateMetadataTemplateFields(
+            type=CreateMetadataTemplateFieldsTypeField.FLOAT,
+            key="incident_type_confidence",
+            display_name="Incident type confidence",
+        ),
+    ]
+
+
+def find_metadata_template(client: BoxClient, template_key: str) -> object | None:
+    marker = None
+    while True:
+        page = client.metadata_templates.get_enterprise_metadata_templates(
+            marker=marker,
+            limit=100,
+        )
+        for template in page.entries or []:
+            if template.template_key == template_key:
+                return template
+        marker = page.next_marker
+        if not marker:
+            return None
+
+
+def ensure_metadata_template(client: BoxClient) -> object:
+    """Find the demo template or create it during the one-time setup."""
+    template_key = metadata_template_key()
+    existing = find_metadata_template(client, template_key)
+    if existing:
+        return existing
+
+    try:
+        return client.metadata_templates.create_metadata_template(
+            scope="enterprise",
+            display_name=METADATA_TEMPLATE_DISPLAY_NAME,
+            template_key=template_key,
+            fields=metadata_template_fields(),
+        )
+    except BoxAPIError as error:
+        if error.response_info.status_code == 403:
+            raise RuntimeError(
+                "Box refused metadata-template creation. Use an Admin or Co-admin "
+                "developer token with permission to create and edit metadata templates."
+            ) from error
+        raise
+
+
+def validate_metadata_template(template: object) -> str:
+    template_key = getattr(template, "template_key", None) or metadata_template_key()
+    field_keys = {
+        field.key
+        for field in (getattr(template, "fields", None) or [])
+        if getattr(field, "key", None)
+    }
+    missing = METADATA_FIELD_KEYS - field_keys
+    if missing:
+        missing_fields = ", ".join(sorted(missing))
+        raise RuntimeError(
+            f"Metadata template {template_key!r} is missing fields: {missing_fields}. "
+            "Choose a new BOX_METADATA_TEMPLATE_KEY or recreate the demo template."
+        )
+    return template_key
+
+
+def setup_metadata_template(client: BoxClient) -> None:
+    template = ensure_metadata_template(client)
+    template_key = validate_metadata_template(template)
+    print(
+        f"Ready to use Box metadata template {template_key!r} "
+        f"({getattr(template, 'scope', 'enterprise')})."
+    )
+
+
+def metadata_values(response: object, decision: str) -> dict[str, object]:
+    answers = response.answers
+    incident_type = answers["incident_type"]
+    severity = answers["severity"]
+    escalation = answers["needs_escalation"]
+    return {
+        "incident_type": incident_type.choice,
+        "triage_decision": decision,
+        "severity_score": round(float(severity.score), 4),
+        "severity_confidence": round(float(severity.confidence), 4),
+        "escalation_probability": round(float(escalation.noul), 4),
+        "incident_type_confidence": round(float(incident_type.confidence), 4),
+    }
+
+
+def apply_metadata(
+    client: BoxClient,
+    file_id: str,
+    template: object,
+    response: object,
+    decision: str,
+) -> str:
+    """Create or update the Jev metadata instance on the source file."""
+    template_key = validate_metadata_template(template)
+    values = metadata_values(response, decision)
+    try:
+        client.file_metadata.get_file_metadata_by_id(
+            file_id,
+            GetFileMetadataByIdScope.ENTERPRISE,
+            template_key,
+        )
+    except BoxAPIError as error:
+        if error.response_info.status_code != 404:
+            raise
+        client.file_metadata.create_file_metadata_by_id(
+            file_id,
+            CreateFileMetadataByIdScope.ENTERPRISE,
+            template_key,
+            values,
+        )
+        return "created"
+
+    updates = [
+        UpdateFileMetadataByIdRequestBody(
+            op=UpdateFileMetadataByIdRequestBodyOpField.REPLACE,
+            path=f"/{key}",
+            value=value,
+        )
+        for key, value in values.items()
+    ]
+    client.file_metadata.update_file_metadata_by_id(
+        file_id,
+        UpdateFileMetadataByIdScope.ENTERPRISE,
+        template_key,
+        updates,
+    )
+    return "updated"
 
 
 def find_report(client: BoxClient, folder_id: str, file_name: str) -> tuple[str, str]:
@@ -180,7 +377,28 @@ def write_back(client: BoxClient, folder_id: str, source_name: str, card: str) -
     return output_name
 
 
+def move_report(client: BoxClient, file_id: str, source_folder_id: str, decision: str) -> str:
+    destination_env = DESTINATION_FOLDER_ENV[decision]
+    destination_folder_id = required(destination_env)
+    if destination_folder_id == source_folder_id:
+        raise RuntimeError(
+            f"{destination_env} must be different from BOX_FOLDER_ID so the report can be routed."
+        )
+    client.files.update_file_by_id(
+        file_id,
+        parent=UpdateFileByIdParent(id=destination_folder_id),
+    )
+    return destination_folder_id
+
+
 def run(args: argparse.Namespace) -> None:
+    if args.setup_template:
+        if args.local:
+            raise RuntimeError("--setup-template requires a Box file flow, not --local.")
+        setup_metadata_template(box_client())
+        return
+
+    file_id = None
     if args.local:
         file_name = Path(args.local).name
         source_text = Path(args.local).read_text(encoding="utf-8")
@@ -205,10 +423,20 @@ def run(args: argparse.Namespace) -> None:
     print(json.dumps({name: answer_payload(answer) for name, answer in response.answers.items()}, indent=2, default=str))
 
     if args.write_back:
-        if client is None:
+        if client is None or file_id is None:
             raise RuntimeError("--write-back requires a Box source document.")
+        template = find_metadata_template(client, metadata_template_key())
+        if template is None:
+            raise RuntimeError(
+                "The Jev Incident Triage metadata template was not found. "
+                "Run `python incident_triage.py --setup-template` once first."
+            )
+        metadata_action = apply_metadata(client, file_id, template, response, decision)
+        print(f"Box metadata instance {metadata_action} on {file_name}")
         output_name = write_back(client, folder_id, file_name, card)
         print(f"Saved decision card to Box as {output_name}")
+        destination_folder_id = move_report(client, file_id, folder_id, decision)
+        print(f"Moved {file_name} to {decision} folder {destination_folder_id}")
 
 
 def main() -> None:
@@ -221,7 +449,12 @@ def main() -> None:
     parser.add_argument(
         "--write-back",
         action="store_true",
-        help="Upload the decision card to the same Box folder.",
+        help="Apply metadata, upload the decision card, and route the source PDF.",
+    )
+    parser.add_argument(
+        "--setup-template",
+        action="store_true",
+        help="Create or reuse the enterprise metadata template, then exit.",
     )
     run(parser.parse_args())
 

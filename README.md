@@ -9,10 +9,11 @@ should be monitored, reviewed, or escalated.
 
 The point is not to make Jev write a better summary.
 
-The point is to make the document useful to a workflow.
+The point is to make the document useful to a workflow and write the resulting
+signals back onto the source file as Box metadata.
 
 ```text
-Box PDF → Box Markdown representation → Jev judgments → application policy → next action
+Box PDF → Box Markdown representation → Jev judgments → application policy → Box metadata + next action
 ```
 
 Jev supplies the semantic signals. Code owns the policy. A person remains in the
@@ -60,8 +61,22 @@ Upload `sample-document/incident-report.pdf` to the Box folder configured in
 BOX_DEVELOPER_TOKEN=your_box_developer_token
 BOX_FOLDER_ID=your_box_folder_id
 BOX_FILE_NAME=incident-report.pdf
+BOX_METADATA_TEMPLATE_KEY=jevIncidentTriage
+BOX_ESCALATE_FOLDER_ID=your_escalate_folder_id
+BOX_MONITOR_FOLDER_ID=your_monitor_folder_id
+BOX_REVIEW_FOLDER_ID=your_review_folder_id
 TYPESAFE_API_KEY=your_typesafe_api_key
 ```
+
+Run this one-time setup command to create the enterprise metadata template:
+
+```bash
+python incident_triage.py --setup-template
+```
+
+The setup is idempotent: if the template key already exists, the script reuses
+it. Creating an enterprise metadata template may require an Admin or Co-admin
+developer token with permission to create and edit metadata templates.
 
 Run the live Box flow:
 
@@ -69,11 +84,25 @@ Run the live Box flow:
 python incident_triage.py --write-back
 ```
 
-The optional `--write-back` flag uploads a timestamped Markdown decision card to
-the same Box folder. To rehearse the Jev part without Box credentials, use the
-checked-in Markdown fixture. In the live flow, Box creates this representation
-from the PDF. The first request may take a few seconds while Box generates the
-representation; the script checks its status and waits for it to become ready:
+The `--write-back` flag applies the extracted incident type, severity score,
+confidence values, escalation probability, and policy decision to the source PDF
+as Box metadata. It uploads a timestamped Markdown decision card to the intake
+folder, then moves the source PDF to the folder selected by the policy:
+
+```text
+ESCALATE → BOX_ESCALATE_FOLDER_ID
+REVIEW    → BOX_REVIEW_FOLDER_ID
+MONITOR   → BOX_MONITOR_FOLDER_ID
+```
+
+If the metadata instance already exists, repeated runs update it in place. Use a
+new copy of the sample PDF in the intake folder for each end-to-end run, because
+the classified source file is moved out of that folder.
+
+To rehearse the Jev part without Box credentials, use the checked-in Markdown
+fixture. In the live flow, Box creates this representation from the PDF. The
+first request may take a few seconds while Box generates the representation; the
+script checks its status and waits for it to become ready:
 
 ```bash
 python incident_triage.py --local sample-document/incident-report.md
