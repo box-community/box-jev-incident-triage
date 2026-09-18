@@ -54,17 +54,19 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Upload `sample-document/incident-report.pdf` to the Box folder configured in
-`.env`, then set:
+Upload `sample-document/incident-report.pdf` to the Box intake folder, copy its
+Box file ID, and set:
 
 ```dotenv
 BOX_DEVELOPER_TOKEN=your_box_developer_token
 BOX_FOLDER_ID=your_box_folder_id
-BOX_FILE_NAME=incident-report.pdf
+BOX_FILE_ID=your_box_file_id
 BOX_METADATA_TEMPLATE_KEY=jevIncidentTriage
 BOX_ESCALATE_FOLDER_ID=your_escalate_folder_id
 BOX_MONITOR_FOLDER_ID=your_monitor_folder_id
 BOX_REVIEW_FOLDER_ID=your_review_folder_id
+BOX_REVIEW_ASSIGNEE_ID=your_box_user_id
+BOX_REVIEW_TASK_MESSAGE=Please review the incident triage and confirm the next action.
 TYPESAFE_API_KEY=your_typesafe_api_key
 ```
 
@@ -98,6 +100,17 @@ MONITOR   → BOX_MONITOR_FOLDER_ID
 If the metadata instance already exists, repeated runs update it in place. Use a
 new copy of the sample PDF in the intake folder for each end-to-end run, because
 the classified source file is moved out of that folder.
+
+To add an optional human handoff, pass `--create-review-task`:
+
+```bash
+python incident_triage.py --write-back --create-review-task
+```
+
+For `ESCALATE` outcomes, the script creates a Box review task on the routed PDF
+and assigns it to `BOX_REVIEW_ASSIGNEE_ID`. `REVIEW` and `MONITOR` outcomes do
+not create a task. The message comes from `BOX_REVIEW_TASK_MESSAGE`. The
+assignee must be a Box collaborator on the file.
 
 To rehearse the Jev part without Box credentials, use the checked-in Markdown
 fixture. In the live flow, Box creates this representation from the PDF. The

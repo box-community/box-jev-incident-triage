@@ -19,6 +19,12 @@ from box_sdk_gen import (
     CreateMetadataTemplateFields,
     CreateMetadataTemplateFieldsOptionsField,
     CreateMetadataTemplateFieldsTypeField,
+    CreateTaskAction,
+    CreateTaskAssignmentAssignTo,
+    CreateTaskAssignmentTask,
+    CreateTaskCompletionRule,
+    CreateTaskItem,
+    CreateTaskItemTypeField,
     FetchOptions,
     GetFileMetadataByIdScope,
     ResponseFormat,
@@ -271,11 +277,11 @@ def apply_metadata(
     return "updated"
 
 
-def find_report(client: BoxClient, folder_id: str, file_name: str) -> tuple[str, str]:
-    for item in client.folders.get_folder_items(folder_id, limit=100).entries:
-        if item.type == "file" and item.name == file_name:
-            return item.id, item.name
-    raise RuntimeError(f"Could not find {file_name!r} in Box folder {folder_id}.")
+def get_file_name(client: BoxClient, file_id: str) -> str:
+    file = client.files.get_file_by_id(file_id, fields=["id", "name"])
+    if not file.name:
+        raise RuntimeError(f"Box returned no name for file {file_id}.")
+    return file.name
 
 
 def download_markdown(client: BoxClient, file_id: str) -> str:
@@ -391,7 +397,40 @@ def move_report(client: BoxClient, file_id: str, source_folder_id: str, decision
     return destination_folder_id
 
 
+def create_review_task(client: BoxClient, file_id: str, file_name: str, decision: str) -> str | None:
+    """Create and assign a Box review task for escalated outcomes."""
+    if decision != "ESCALATE":
+        return None
+
+    assignee_id = required("BOX_REVIEW_ASSIGNEE_ID")
+    message = os.environ.get("BOX_REVIEW_TASK_MESSAGE", "").strip()
+    if not message:
+        message = (
+            f"Please review the escalated incident triage for {file_name} "
+            "and confirm the next action."
+        )
+
+    task = client.tasks.create_task(
+        CreateTaskItem(id=file_id, type=CreateTaskItemTypeField.FILE),
+        action=CreateTaskAction.REVIEW,
+        message=message,
+        completion_rule=CreateTaskCompletionRule.ANY_ASSIGNEE,
+    )
+    if not task.id:
+        raise RuntimeError("Box created a task without returning a task ID.")
+
+    assignment = client.task_assignments.create_task_assignment(
+        CreateTaskAssignmentTask(id=task.id),
+        CreateTaskAssignmentAssignTo(id=assignee_id),
+    )
+    if not assignment.id:
+        raise RuntimeError("Box created a task assignment without returning an assignment ID.")
+    return task.id
+
+
 def run(args: argparse.Namespace) -> None:
+    if args.create_review_task and not args.write_back:
+        raise RuntimeError("--create-review-task requires --write-back.")
     if args.setup_template:
         if args.local:
             raise RuntimeError("--setup-template requires a Box file flow, not --local.")
@@ -407,8 +446,8 @@ def run(args: argparse.Namespace) -> None:
     else:
         client = box_client()
         folder_id = required("BOX_FOLDER_ID")
-        file_name = os.environ.get("BOX_FILE_NAME", "incident-report.pdf")
-        file_id, file_name = find_report(client, folder_id, file_name)
+        file_id = required("BOX_FILE_ID")
+        file_name = get_file_name(client, file_id)
         source_text = download_markdown(client, file_id)
 
     with TypeSafeClient() as typesafe:
@@ -437,6 +476,12 @@ def run(args: argparse.Namespace) -> None:
         print(f"Saved decision card to Box as {output_name}")
         destination_folder_id = move_report(client, file_id, folder_id, decision)
         print(f"Moved {file_name} to {decision} folder {destination_folder_id}")
+        if args.create_review_task:
+            task_id = create_review_task(client, file_id, file_name, decision)
+            if task_id:
+                print(f"Created Box review task {task_id} for {decision.lower()} outcome")
+            else:
+                print("No review task created for MONITOR outcome")
 
 
 def main() -> None:
@@ -455,6 +500,11 @@ def main() -> None:
         "--setup-template",
         action="store_true",
         help="Create or reuse the enterprise metadata template, then exit.",
+    )
+    parser.add_argument(
+        "--create-review-task",
+        action="store_true",
+        help="After routing, create and assign a Box review task for ESCALATE only.",
     )
     run(parser.parse_args())
 
